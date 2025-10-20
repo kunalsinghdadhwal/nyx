@@ -8,7 +8,9 @@ require (
 	github.com/ethereum/go-ethereum v1.16.5
 	github.com/go-redis/redis/v8 v8.11.5
 	github.com/lib/pq v1.10.9
+	github.com/shopspring/decimal v1.4.0
 	go.uber.org/zap v1.27.0
+	golang.org/x/crypto v0.36.0
 	gorm.io/gorm v1.31.0
 )
 
@@ -35,7 +37,6 @@ require (
 	github.com/tklauser/go-sysconf v0.3.12 // indirect
 	github.com/tklauser/numcpus v0.6.1 // indirect
 	go.uber.org/multierr v1.11.0 // indirect
-	golang.org/x/crypto v0.36.0 // indirect
 	golang.org/x/sync v0.12.0 // indirect
 	golang.org/x/sys v0.36.0 // indirect
 	golang.org/x/text v0.23.0 // indirect
