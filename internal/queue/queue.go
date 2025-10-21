@@ -57,6 +57,7 @@ type BlockProcessorQueue struct {
 	UnconfimedFailedChan chan Request
 	UnconfirmedDoneChan  chan Request
 	ConfirmedFailedChan  chan Request
+	ConfirmedDoneChan    chan Request
 	StatChan             chan Stat
 	LatestChan           chan Update
 	UnconfirmedNextChan  chan Next
@@ -93,13 +94,13 @@ func New(startedWith uint64) *BlockProcessorQueue {
 		UnconfimedFailedChan: make(chan Request, 128),
 		UnconfirmedDoneChan:  make(chan Request, 128),
 		ConfirmedFailedChan:  make(chan Request, 128),
+		ConfirmedDoneChan:    make(chan Request, 128),
 		StatChan:             make(chan Stat, 1),
 		LatestChan:           make(chan Update, 1),
 		UnconfirmedNextChan:  make(chan Next, 1),
 		ConfirmedNextChan:    make(chan Next, 1),
 	}
 }
-
 
 func (q *BlockProcessorQueue) Put(block uint64) bool {
 	resp := make(chan bool)
@@ -121,7 +122,7 @@ func (q *BlockProcessorQueue) CanPublish(block uint64) bool {
 		BlockNumber:  block,
 		ResponseChan: resp,
 	}
-	
+
 	q.CanPublishChan <- req
 	return <-resp
 }
@@ -226,7 +227,7 @@ func (q *BlockProcessorQueue) Latest(num uint64) bool {
 
 	q.LatestChan <- req
 
-	return <-resp	
+	return <-resp
 }
 
 func (q *BlockProcessorQueue) UnconfirmedNext() (uint64, bool) {
@@ -264,7 +265,7 @@ func (q *BlockProcessorQueue) ConfirmedNext() (uint64, bool) {
 
 func (q *BlockProcessorQueue) CanBeConfirmed(block uint64) bool {
 	var blockConfirmations int = 0
-	
+
 	if os.Getenv("BLOCK_CONFIRMATIONS") != "" {
 		blockConfirmationsEnv, err := strconv.Atoi(os.Getenv("BLOCK_CONFIRMATIONS"))
 		if err != nil {
@@ -278,7 +279,7 @@ func (q *BlockProcessorQueue) CanBeConfirmed(block uint64) bool {
 		return false
 	}
 
-	return q.LatestBlock - uint64(blockConfirmations) >= block
+	return q.LatestBlock-uint64(blockConfirmations) >= block
 }
 
 func (q *BlockProcessorQueue) TotalBlocks() uint64 {
@@ -288,31 +289,213 @@ func (q *BlockProcessorQueue) TotalBlocks() uint64 {
 func (q *BlockProcessorQueue) Start(ctx context.Context) {
 	for {
 		select {
-			case <-ctx.Done():
-				return
+		case <-ctx.Done():
+			return
 
-			case req := <-q.PutChan:
-				if _, ok := q.Blocks[req.BlockNumber]; ok {
-					req.ResponseChan <- false
+		case req := <-q.PutChan:
+			if _, ok := q.Blocks[req.BlockNumber]; ok {
+				req.ResponseChan <- false
+				break
+			}
+
+			q.Blocks[req.BlockNumber] = &Block{
+				UnconfirmedProgress: true,
+				LastAttempted:       time.Now().UTC(),
+				Delay:               time.Duration(1) * time.Second,
+			}
+			req.ResponseChan <- true
+
+		case req := <-q.CanPublishChan:
+			block, ok := q.Blocks[req.BlockNumber]
+			if !ok {
+				req.ResponseChan <- false
+				break
+			}
+			req.ResponseChan <- !block.Published
+
+		case req := <-q.PublishedChan:
+			block, ok := q.Blocks[req.BlockNumber]
+			if !ok {
+				req.ResponseChan <- false
+				break
+			}
+			block.Published = true
+			req.ResponseChan <- true
+
+		case req := <-q.InsertedChan:
+			_, ok := q.Blocks[req.BlockNumber]
+			if !ok {
+				req.ResponseChan <- false
+				break
+			}
+			q.TotalInserted++
+			req.ResponseChan <- true
+
+		case req := <-q.UnconfimedFailedChan:
+			block, ok := q.Blocks[req.BlockNumber]
+			if !ok {
+				req.ResponseChan <- false
+				break
+			}
+
+			block.UnconfirmedProgress = false
+			block.SetDelay()
+			req.ResponseChan <- true
+
+		case req := <-q.UnconfirmedDoneChan:
+			block, ok := q.Blocks[req.BlockNumber]
+			if !ok {
+				req.ResponseChan <- false
+				break
+			}
+
+			block.UnconfirmedProgress = false
+			block.UnconfirmedDone = true
+			block.ConfirmedDone = q.CanBeConfirmed(req.BlockNumber)
+			block.ResetDelay()
+			block.SetLastAttempted()
+			req.ResponseChan <- true
+
+		case req := <-q.ConfirmedFailedChan:
+			block, ok := q.Blocks[req.BlockNumber]
+			if !ok {
+				req.ResponseChan <- false
+				break
+			}
+
+			block.ConfirmedProgress = false
+			block.SetDelay()
+			req.ResponseChan <- true
+
+		case req := <-q.ConfirmedDoneChan:
+			block, ok := q.Blocks[req.BlockNumber]
+			if !ok {
+				req.ResponseChan <- false
+				break
+			}
+
+			block.ConfirmedProgress = false
+			block.ConfirmedDone = true
+
+			req.ResponseChan <- true
+
+		case nxt := <-q.UnconfirmedNextChan:
+			var selected uint64
+			var found bool
+
+			for k := range q.Blocks {
+
+				if q.Blocks[k].UnconfirmedProgress || q.Blocks[k].UnconfirmedDone {
+					continue
+				}
+
+				if q.Blocks[k].ConfirmedDone || q.Blocks[k].ConfirmedProgress {
+					continue
+				}
+
+				if q.Blocks[k].CanAttempt() {
+					selected = k
+					found = true
 					break
 				}
+			}
 
-				q.Blocks[req.BlockNumber] = &Block{
-					UnconfirmedProgress: true,
-					LastAttempted: time.Now().UTC(),
-					Delay: time.Duration(1) * time.Second,
+			if !found {
+				nxt.ResponseChan <- struct {
+					Status bool
+					Number uint64
+				}{Status: false}
+				break
+			}
+
+			q.Blocks[selected].SetLastAttempted()
+			q.Blocks[selected].UnconfirmedProgress = true
+
+			nxt.ResponseChan <- struct {
+				Status bool
+				Number uint64
+			}{Status: true, Number: selected}
+
+		case nxt := <-q.ConfirmedNextChan:
+			var selected uint64
+			var found bool
+
+			for k := range q.Blocks {
+
+				if q.Blocks[k].ConfirmedProgress || q.Blocks[k].ConfirmedDone {
+					continue
 				}
-				req.ResponseChan <- true
-			
-			case req := <-q.CanPublishChan:
-				block, ok := q.Blocks[req.BlockNumber]
-				if !ok {
-					req.ResponseChan <- false
+
+				if !q.Blocks[k].UnconfirmedDone {
+					continue
+				}
+
+				if q.Blocks[k].CanAttempt() && q.CanBeConfirmed(k) {
+					selected = k
+					found = true
 					break
 				}
-				req.ResponseChan <- !block.Published
-		
-			
+			}
+
+			if !found {
+				nxt.ResponseChan <- struct {
+					Status bool
+					Number uint64
+				}{Status: false}
+				break
+			}
+
+			q.Blocks[selected].SetLastAttempted()
+			q.Blocks[selected].ConfirmedProgress = true
+
+			nxt.ResponseChan <- struct {
+				Status bool
+				Number uint64
+			}{Status: true, Number: selected}
+
+		case req := <-q.StatChan:
+
+			var stat StatResponse
+
+			for k := range q.Blocks {
+
+				if q.Blocks[k].UnconfirmedProgress {
+					stat.UnconfirmedProgress++
+					continue
+				}
+
+				if q.Blocks[k].UnconfirmedProgress == q.Blocks[k].UnconfirmedDone {
+					stat.UnconfirmedWaiting++
+					continue
+				}
+
+				if q.Blocks[k].ConfirmedProgress {
+					stat.ConfirmedProgress++
+					continue
+				}
+
+				if q.Blocks[k].ConfirmedProgress == q.Blocks[k].ConfirmedDone {
+					stat.ConfirmedWaiting++
+					continue
+				}
+			}
+
+			stat.Total = q.Total
+			req.ResponseChan <- stat
+
+		case udt := <-q.LatestChan:
+
+			q.LatestBlock = udt.BlockNumber
+			udt.ResponseChan <- true
+
+		case <-time.After(time.Duration(1) * time.Second):
+			for k := range q.Blocks {
+				if q.Blocks[k].ConfirmedDone {
+					delete(q.Blocks, k)
+					q.Total++
+				}
+			}
+
 		}
 	}
 }
